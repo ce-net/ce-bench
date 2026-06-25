@@ -162,6 +162,42 @@ export async function probeRpcRtt(a) {
 }
 
 /**
+ * Directed message round-trip ("send RTT"): time `POST /mesh/send` to a peer. The peer's NODE answers
+ * with an `AppAck` from its protocol handler the moment it enqueues the message — no app responder
+ * required. This is the purest app-visible transport+protocol RTT for directed mesh messaging (the
+ * latency floor under request/reply, which adds the remote app's stream->reply hop on top). Works to
+ * any live peer; compare against the `/netgraph` ping floor to see node+serde overhead.
+ *
+ * @param {object} a
+ * @param {CeClient|string|object} a.ce
+ * @param {string} a.to                64-hex node id of a live peer.
+ * @param {number} [a.bytes]           Payload size. Default 64.
+ * @param {number} [a.iters]           Default 50.
+ * @param {number} [a.concurrency]     Default 1.
+ */
+export async function probeSendRtt(a) {
+  const ce = asCe(a.ce);
+  const bytes = a.bytes ?? 64;
+  const payload = randomBytes(bytes);
+  const topic = "ce-bench/sink"; // arbitrary; AppAck does not depend on a subscriber
+  const r = await timedBatch({
+    op: () => ce.meshSend(a.to, topic, payload),
+    iters: a.iters ?? 50,
+    concurrency: a.concurrency ?? 1,
+  });
+  return {
+    kind: "send_rtt",
+    target: a.to,
+    bytes,
+    concurrency: a.concurrency ?? 1,
+    ms: stats(r.latencies),
+    reqs_per_sec: r.opsPerSec,
+    errors: r.errors,
+    errorSample: r.errorSample,
+  };
+}
+
+/**
  * Blob PUT throughput/latency at a fixed size. Each op uploads a fresh random blob (distinct bytes
  * => distinct hash => no dedupe short-circuit).
  */
@@ -274,6 +310,86 @@ export async function probeBlobGetRemote(a) {
     fetched: got,
     errors,
     errorSample,
+  };
+}
+
+/**
+ * Object round-trip: chunk a `size`-byte object into `chunkSize` blobs, PUT them all (optionally in
+ * parallel), then GET them all back. This is exactly how ce-storage (S3 PutObject/GetObject) and
+ * ce-drive (file upload/download) move data — content-addressed chunks over the blob primitive — so
+ * it is the app-representative large-file throughput number. Reports separate upload/download
+ * aggregate MB/s plus per-chunk latency.
+ *
+ * @param {object} a
+ * @param {CeClient|string|object} a.ce
+ * @param {number} [a.size]            Object size in bytes. Default 16 MiB.
+ * @param {number} [a.chunkSize]       Chunk size. Default 1 MiB (matches ce-rs data::chunk_object).
+ * @param {number} [a.concurrency]     Parallel chunk PUT/GET. Default 8 (what a real client uses).
+ */
+export async function probeObjectRoundtrip(a) {
+  const ce = asCe(a.ce);
+  const size = a.size ?? 16 * (1 << 20);
+  const chunkSize = a.chunkSize ?? 1 << 20;
+  const concurrency = a.concurrency ?? 8;
+  const nChunks = Math.max(1, Math.ceil(size / chunkSize));
+  // Distinct content per chunk (and per call) so nothing is deduped away.
+  const salt = randomBytes(8);
+  const mkChunk = (i) => {
+    const b = randomBytes(chunkSize);
+    b.set(salt, 0);
+    b[8] = i & 0xff;
+    b[9] = (i >> 8) & 0xff;
+    return b;
+  };
+
+  // Upload
+  const upStart = now();
+  const hashes = new Array(nChunks);
+  const upLat = [];
+  {
+    let next = 0;
+    const worker = async () => {
+      while (true) {
+        const i = next++;
+        if (i >= nChunks) return;
+        const t0 = now();
+        hashes[i] = await ce.putBlob(mkChunk(i));
+        upLat.push(now() - t0);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, nChunks) }, worker));
+  }
+  const upMs = now() - upStart;
+
+  // Download
+  const dnStart = now();
+  const dnLat = [];
+  let dnBytes = 0;
+  {
+    let next = 0;
+    const worker = async () => {
+      while (true) {
+        const i = next++;
+        if (i >= nChunks) return;
+        const t0 = now();
+        const bytes = await ce.getBlob(hashes[i]);
+        dnLat.push(now() - t0);
+        dnBytes += bytes.length;
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, nChunks) }, worker));
+  }
+  const dnMs = now() - dnStart;
+
+  const total = chunkSize * nChunks;
+  return {
+    kind: "object_roundtrip",
+    size,
+    chunkSize,
+    nChunks,
+    concurrency,
+    upload: { ms: stats(upLat), agg_mb_per_sec: total / (1 << 20) / (upMs / 1000), wall_ms: upMs },
+    download: { ms: stats(dnLat), agg_mb_per_sec: dnBytes / (1 << 20) / (dnMs / 1000), wall_ms: dnMs },
   };
 }
 

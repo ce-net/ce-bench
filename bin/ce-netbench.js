@@ -21,9 +21,11 @@ import { writeFileSync } from "node:fs";
 import { CeClient } from "../src/ce.js";
 import {
   probeRpcRtt,
+  probeSendRtt,
   probeBlobPut,
   probeBlobGetLocal,
   probeBlobGetRemote,
+  probeObjectRoundtrip,
   probePubsubProp,
   pingBaseline,
   sweep,
@@ -35,6 +37,13 @@ const baseUrl = args.url || "http://127.0.0.1:8844";
 const token = args.token || apiToken();
 const quick = !!args.quick;
 const ce = new CeClient({ baseUrl, token, timeoutMs: 60000 });
+
+// A node under mining load can RST a large upload mid-stream; undici surfaces that as an async
+// rejection that can escape a probe's try/catch. Swallow it (it's already counted as a probe error)
+// so a single dropped connection never aborts the whole run.
+process.on("unhandledRejection", (e) => {
+  log(`  [warn] unhandled rejection (continuing): ${e && e.message ? e.message : e}`);
+});
 
 const KiB = 1024;
 const MiB = 1024 * 1024;
@@ -109,10 +118,40 @@ for (const peer of peers) {
   });
 }
 
+// ---- 3b. Directed send round-trip to peers (AppAck; needs NO responder) ---
+// This is the universal real-mesh latency probe: the remote node ACKs at the protocol layer, so it
+// works to any live peer. Swept across payload sizes AND concurrency (the concurrency curve reveals
+// whether directed RPC parallelizes or serializes).
+log("[3b] send_rtt to peers (AppAck round-trip, no responder needed)...");
+report.sections.send_peers = {};
+for (const peer of peers) {
+  const probe = await probeSendRtt({ ce, to: peer, bytes: 64, iters: 5 }).catch((e) => ({ error: e.message, errors: 99 }));
+  if (probe.error || probe.errors >= 5) {
+    report.sections.send_peers[peer] = { skipped: true, reason: probe.error || "no AppAck (peer offline / unreachable)" };
+    log(`  ${peer.slice(0, 12)}: skipped (${report.sections.send_peers[peer].reason})`);
+    continue;
+  }
+  const bySize = await sweep({ probe: probeSendRtt, base: { ce, to: peer, iters: RPC_ITERS }, sizes: RPC_SIZES, sizeKey: "bytes", onResult: (r) => liveRpc(r, peer) });
+  const byConc = await sweep({ probe: probeSendRtt, base: { ce, to: peer, bytes: KiB, iters: Math.max(RPC_ITERS, 40) }, concurrency: CONC_LEVELS, onResult: (r) => log(`  ${peer.slice(0, 12)} c=${r.concurrency}: p50 ${r.ms.p50.toFixed(1)}ms p99 ${r.ms.p99.toFixed(1)}ms ${r.reqs_per_sec.toFixed(0)} req/s`) });
+  report.sections.send_peers[peer] = { bySize, byConc };
+}
+
 // ---- 4. Blob put / get local ----------------------------------------------
 log("[4/6] blob put + get (local)...");
 report.sections.blob_put = await sweep({ probe: probeBlobPut, base: { ce, iters: BLOB_ITERS }, sizes: BLOB_SIZES, onResult: liveBlob });
 report.sections.blob_get_local = await sweep({ probe: probeBlobGetLocal, base: { ce, iters: BLOB_ITERS }, sizes: BLOB_SIZES, onResult: liveBlob });
+
+// ---- 4b. Object round-trip (app-representative chunked file transfer) ------
+log("[4b] object round-trip (chunked, like ce-storage / ce-drive)...");
+const objSizes = quick ? [4 * MiB] : [4 * MiB, 16 * MiB];
+report.sections.object = [];
+for (const size of objSizes) {
+  const r = await probeObjectRoundtrip({ ce, size, concurrency: 8 }).catch((e) => ({ error: e.message, size }));
+  report.sections.object.push(r);
+  if (!r.error)
+    log(`  ${fmtSize(size)} (${r.nChunks}x${fmtSize(r.chunkSize)}, c=${r.concurrency}): up ${r.upload.agg_mb_per_sec.toFixed(1)} MB/s, down ${r.download.agg_mb_per_sec.toFixed(1)} MB/s`);
+  else log(`  ${fmtSize(size)}: ${r.error}`);
+}
 
 // ---- 5. Blob get remote (cold cross-node fetch) ---------------------------
 log("[5/6] blob get (remote, cold)...");
@@ -228,6 +267,35 @@ function renderMarkdown(rep) {
   }
   L.push("");
 
+  // Directed send RTT (the universal real-mesh probe)
+  L.push(`## 2b. Directed mesh round-trip (\`/mesh/send\` AppAck, no responder)`);
+  L.push("");
+  L.push("The remote node ACKs at the protocol layer. This is the latency floor for directed mesh");
+  L.push("messaging. Compare p50 to the ping floor (node+serde overhead) and watch the concurrency");
+  L.push("curve (flat req/s + rising p50 == the path serializes / head-of-line blocks).");
+  L.push("");
+  let anySend = false;
+  for (const [peer, sec] of Object.entries(rep.sections.send_peers || {})) {
+    if (sec.skipped) {
+      L.push(`**\`${peer.slice(0, 12)}\`** — _skipped: ${sec.reason}_\n`);
+      continue;
+    }
+    anySend = true;
+    L.push(`**peer \`${peer.slice(0, 12)}\`** — by payload size:`);
+    L.push("");
+    L.push("| payload | p50 | p90 | p99 | mean | req/s |");
+    L.push("|---|---:|---:|---:|---:|---:|");
+    for (const r of arr(sec.bySize)) L.push(`| ${fmtSize(r.bytes)} | ${ms(r.ms.p50)} | ${ms(r.ms.p90)} | ${ms(r.ms.p99)} | ${ms(r.ms.mean)} | ${r.reqs_per_sec.toFixed(0)} |`);
+    L.push("");
+    L.push(`by concurrency (payload 1KiB):`);
+    L.push("");
+    L.push("| concurrency | p50 | p99 | req/s |");
+    L.push("|---:|---:|---:|---:|");
+    for (const r of arr(sec.byConc)) L.push(`| ${r.concurrency} | ${ms(r.ms.p50)} | ${ms(r.ms.p99)} | ${r.reqs_per_sec.toFixed(0)} |`);
+    L.push("");
+  }
+  if (!anySend && !Object.keys(rep.sections.send_peers || {}).length) L.push("_(no peers)_\n");
+
   // Blob
   L.push(`## 3. Blob store (local)`);
   L.push("");
@@ -235,6 +303,20 @@ function renderMarkdown(rep) {
   L.push("|---|---|---:|---:|---:|---:|---:|");
   for (const r of arr(rep.sections.blob_put)) L.push(blobRow(r));
   for (const r of arr(rep.sections.blob_get_local)) L.push(blobRow(r));
+  L.push("");
+
+  // Object round-trip
+  L.push(`## 3b. Object round-trip (chunked, app-representative)`);
+  L.push("");
+  L.push("How ce-storage (PutObject/GetObject) and ce-drive (file up/download) actually move data:");
+  L.push("a file split into chunks, content-addressed, transferred with client parallelism.");
+  L.push("");
+  L.push("| object | chunks | conc | upload MB/s | up p50 ms | download MB/s | down p50 ms |");
+  L.push("|---|---|---:|---:|---:|---:|---:|");
+  for (const r of arr(rep.sections.object)) {
+    if (r.error) L.push(`| ${fmtSize(r.size || 0)} | _err_ | | | | | ${r.error} |`);
+    else L.push(`| ${fmtSize(r.size)} | ${r.nChunks}x${fmtSize(r.chunkSize)} | ${r.concurrency} | ${r.upload.agg_mb_per_sec.toFixed(1)} | ${ms(r.upload.ms.p50)} | ${r.download.agg_mb_per_sec.toFixed(1)} | ${ms(r.download.ms.p50)} |`);
+  }
   L.push("");
 
   // Remote blob
