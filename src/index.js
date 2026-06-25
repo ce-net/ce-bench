@@ -22,6 +22,10 @@ export * from "./runner.js";
 export * from "./profile.js";
 export * from "./fabricstats.js";
 
+// Network & primitive benchmarks (latency/throughput over the real mesh) + the echo responder.
+export * from "./net.js";
+export { startEchoResponder } from "./echo.js";
+
 /** @typedef {import("./types.js").BenchResult} BenchResult */
 /** @typedef {import("./types.js").FabricStats} FabricStats */
 

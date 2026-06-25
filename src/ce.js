@@ -170,6 +170,144 @@ export class CeClient {
       throw e;
     }
   }
+
+  // ---- Core primitives (used by the network benchmark suite, src/net.js) ----
+  //
+  // These wrap the mutating routes that move bytes/RPC over the mesh. Unlike the JSON helpers
+  // above, blob put/get speak raw octet-streams, so they bypass `_request` and stream bytes.
+
+  /** @private — raw-body fetch with a per-request timeout + bearer auth on writes. */
+  async _raw(method, path, body, accept) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
+    /** @type {Record<string,string>} */
+    const headers = { ...this.headers };
+    if (accept) headers["accept"] = accept;
+    if (body !== undefined) headers["content-type"] = "application/octet-stream";
+    if (method !== "GET" && this.token) headers["authorization"] = `Bearer ${this.token}`;
+    try {
+      const res = await this._fetch(joinUrl(this.baseUrl, path), { method, headers, body, signal: ctrl.signal });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} ${method} ${path}${detail ? `: ${detail.slice(0, 200)}` : ""}`);
+      }
+      return res;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * POST /blobs — content-address a blob. Body is the raw bytes; returns the SHA256 hash hex.
+   * @param {Uint8Array} bytes
+   * @returns {Promise<string>} hash
+   */
+  async putBlob(bytes) {
+    const res = await this._raw("POST", "/blobs", bytes, "application/json");
+    const j = await res.json();
+    if (!j || !j.hash) throw new Error("putBlob: no hash in response");
+    return j.hash;
+  }
+
+  /**
+   * GET /blobs/:hash — fetch a blob by hash. Local hit, else mesh fetch via DHT provider lookup.
+   * @param {string} hash
+   * @returns {Promise<Uint8Array>}
+   */
+  async getBlob(hash) {
+    const res = await this._raw("GET", `/blobs/${hash}`, undefined, "application/octet-stream");
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /**
+   * POST /mesh/request — directed request/reply over the mesh. Resolves to the reply bytes.
+   * The target node must have an app subscribed to `topic` that answers (see src/echo.js).
+   * @param {{to:string, topic:string, payload?:Uint8Array|string, timeoutMs?:number}} a
+   * @returns {Promise<Uint8Array>} reply payload
+   */
+  async meshRequest(a) {
+    const j = await this._request("POST", "/mesh/request", {
+      to: a.to,
+      topic: a.topic,
+      payload_hex: a.payload === undefined ? "" : toHex(a.payload),
+      timeout_ms: a.timeoutMs ?? 30000,
+    });
+    return fromHex(j.payload_hex ?? "");
+  }
+
+  /** POST /mesh/reply — answer a request that carried a reply_token. */
+  meshReply(token, payload) {
+    return this._request("POST", "/mesh/reply", {
+      token,
+      payload_hex: payload === undefined ? "" : toHex(payload),
+    });
+  }
+
+  /** POST /mesh/send — fire-and-forget directed message (no reply awaited). */
+  meshSend(to, topic, payload) {
+    return this._request("POST", "/mesh/send", {
+      to,
+      topic,
+      payload_hex: payload === undefined ? "" : toHex(payload),
+    });
+  }
+
+  /** POST /mesh/subscribe — join an app pub/sub topic so messages land in the inbox + stream. */
+  subscribe(topic) {
+    return this._request("POST", "/mesh/subscribe", { topic });
+  }
+
+  /** POST /mesh/publish — broadcast on an app pub/sub topic. */
+  publish(topic, payload) {
+    return this._request("POST", "/mesh/publish", {
+      topic,
+      payload_hex: payload === undefined ? "" : toHex(payload),
+    });
+  }
+
+  /** GET /mesh/messages — snapshot of recently-received app messages. */
+  meshMessages() {
+    return this._request("GET", "/mesh/messages");
+  }
+
+  /**
+   * GET /mesh/messages/stream — SSE push of inbound app messages. Yields parsed AppMessage objects
+   * {from, topic, payload_hex, received_at, reply_token} until `signal` aborts. Node 18+/browser.
+   * @param {AbortSignal} [signal]
+   * @returns {AsyncGenerator<{from:string,topic:string,payload_hex:string,received_at:number,reply_token:number|null}>}
+   */
+  async *meshMessageStream(signal) {
+    const res = await this._fetch(joinUrl(this.baseUrl, "/mesh/messages/stream"), {
+      headers: { accept: "text/event-stream", ...this.headers },
+      signal,
+    });
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} GET /mesh/messages/stream`);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, nl);
+        buf = buf.slice(nl + 2);
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("data:")) {
+            const payload = line.slice(5).trim();
+            if (payload) {
+              try {
+                yield JSON.parse(payload);
+              } catch {
+                /* keep-alive / non-JSON frame */
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 /** @typedef {object} HubClientOptions

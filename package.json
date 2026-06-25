@@ -11,11 +11,22 @@
     "./runner": "./src/runner.js",
     "./profile": "./src/profile.js",
     "./fabricstats": "./src/fabricstats.js",
+    "./net": "./src/net.js",
+    "./echo": "./src/echo.js",
     "./types": "./src/types.js",
     "./ce": "./src/ce.js"
   },
+  "bin": {
+    "ce-netbench": "./bin/ce-netbench.js",
+    "ce-echo": "./bin/ce-echo.js"
+  },
+  "scripts": {
+    "netbench": "node bin/ce-netbench.js",
+    "echo": "node bin/ce-echo.js"
+  },
   "files": [
     "src",
+    "bin",
     "docs",
     "README.md"
   ],
