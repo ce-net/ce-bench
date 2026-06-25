@@ -111,6 +111,38 @@ Co-located apps cannot do request/reply to themselves. Fix: rebuild + redeploy t
 8. Reduce per-op channel hops in the RPC path; add event-loop fairness so gossip/mining bursts don't
    starve RPC (F2).
 
+## Optimizations implemented & deployed (2026-06-25)
+
+Acting on the findings, shipped and (relay) deployed:
+
+**Node data-layer (`ce-node`, commit on `ce` main) — no consensus changes:**
+- **F4 fixed** — `put_blob` no longer awaits the DHT provide-announce; it spawns it fire-and-forget.
+  This was the ~1 s write floor. Validated on the relay (real DHT): **1 MiB blob PUT = ~10 ms**.
+- **F2 fixed** — blob read/write run in `spawn_blocking`, off the async runtime, so concurrent
+  requests and (on a miner) mining no longer stall blob IO / cause the big p99 tails.
+- **Placement** — `fetch_chunk_from_mesh` now ranks DHT providers by measured `/netgraph` RTT
+  (nearest first) and **races the nearest few in parallel**, first CID-valid reply wins, instead of a
+  random sequential scan. Cross-node fetch is now locality-aware.
+- **F7** — the self-request short-circuit landed upstream (node PR #3), so co-located apps can
+  request/reply to themselves.
+
+**App-layer (already covered in `app-benchmark-findings.md`):** D1 push-stream serve loop (metadata
+ops 140 ms→17 ms), D3 parallel object chunks, D5 cached open snapshot (open 888 ms→15 ms).
+
+**Deploy status:**
+- **Relay node: deployed + verified live** (built release on the relay, backed up the old binary,
+  swapped `/usr/local/bin/ce`, restarted `ce-relay`, confirmed service active + chain intact +
+  ce-net.com healthy; rollback was staged). Blob PUT/GET validated fast on the real DHT.
+- **Laptop node: deferred** — it runs `ce start --light` (not mining, so the F2 win is smaller) and
+  has only ~12 GB free; a from-scratch release build risks the disk. Update it when there's headroom
+  (or via a release tarball); the code is on `main`.
+
+**Still open (out of this pass's scope):**
+- The node's `/blobs` route has a small default body limit (~2 MB) — raw single-blob PUTs above it are
+  rejected (this is what looked like the "8 MiB RST"). Apps chunk to 1 MiB so they're unaffected;
+  raising `DefaultBodyLimit` on the blob route is an easy follow-up for raw large-blob users.
+- F1 (single-Swarm RPC serialization) and per-op hop reduction remain the deeper transport work.
+
 ## App benchmarks (ce-storage, ce-drive, ...)
 
 These apps move data as content-addressed chunks over the blob primitive, so their throughput is
