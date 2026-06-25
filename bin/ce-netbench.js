@@ -219,9 +219,11 @@ async function withInlineResponder(client, fn) {
 
 function liveRpc(r, peer) {
   const who = peer ? peer.slice(0, 12) : "self";
+  if (r.error || !r.ms) return log(`  ${who} ${fmtSize(r.bytes || 0)}: error ${r.error || "no data"}`);
   log(`  ${who} ${fmtSize(r.bytes)}: p50 ${r.ms.p50.toFixed(2)}ms p99 ${r.ms.p99.toFixed(2)}ms ${r.reqs_per_sec.toFixed(0)} req/s (${r.errors} err)`);
 }
 function liveBlob(r) {
+  if (r.error || !r.ms) return log(`  blob ${fmtSize(r.size || 0)}: error ${r.error || "no data"}`);
   log(`  ${r.kind} ${fmtSize(r.size)}: p50 ${r.ms.p50.toFixed(2)}ms ${r.mb_per_sec.toFixed(1)} MB/s (agg ${r.agg_mb_per_sec.toFixed(1)} MB/s, ${r.errors} err)`);
 }
 
@@ -285,13 +287,13 @@ function renderMarkdown(rep) {
     L.push("");
     L.push("| payload | p50 | p90 | p99 | mean | req/s |");
     L.push("|---|---:|---:|---:|---:|---:|");
-    for (const r of arr(sec.bySize)) L.push(`| ${fmtSize(r.bytes)} | ${ms(r.ms.p50)} | ${ms(r.ms.p90)} | ${ms(r.ms.p99)} | ${ms(r.ms.mean)} | ${r.reqs_per_sec.toFixed(0)} |`);
+    for (const r of arr(sec.bySize)) if (r.ms) L.push(`| ${fmtSize(r.bytes)} | ${ms(r.ms.p50)} | ${ms(r.ms.p90)} | ${ms(r.ms.p99)} | ${ms(r.ms.mean)} | ${r.reqs_per_sec.toFixed(0)} |`);
     L.push("");
     L.push(`by concurrency (payload 1KiB):`);
     L.push("");
     L.push("| concurrency | p50 | p99 | req/s |");
     L.push("|---:|---:|---:|---:|");
-    for (const r of arr(sec.byConc)) L.push(`| ${r.concurrency} | ${ms(r.ms.p50)} | ${ms(r.ms.p99)} | ${r.reqs_per_sec.toFixed(0)} |`);
+    for (const r of arr(sec.byConc)) if (r.ms) L.push(`| ${r.concurrency} | ${ms(r.ms.p50)} | ${ms(r.ms.p99)} | ${r.reqs_per_sec.toFixed(0)} |`);
     L.push("");
   }
   if (!anySend && !Object.keys(rep.sections.send_peers || {}).length) L.push("_(no peers)_\n");
@@ -360,9 +362,11 @@ function renderMarkdown(rep) {
   return L.join("\n");
 
   function rpcRow(label, r) {
+    if (r.error || !r.ms) return `| \`${label}\` | ${fmtSize(r.bytes || 0)} | _err_ | | | | ${r.error || ""} |`;
     return `| \`${label}\` | ${fmtSize(r.bytes)} | ${ms(r.ms.p50)} | ${ms(r.ms.p90)} | ${ms(r.ms.p99)} | ${r.reqs_per_sec.toFixed(0)} | ${r.errors} |`;
   }
   function blobRow(r) {
+    if (r.error || !r.ms) return `| ${(r.kind || "blob").replace("blob_", "")} | ${fmtSize(r.size || 0)} | _err_ | | | | ${r.error || ""} |`;
     return `| ${r.kind.replace("blob_", "")} | ${fmtSize(r.size)} | ${ms(r.ms.p50)} | ${ms(r.ms.p99)} | ${r.mb_per_sec.toFixed(1)} | ${r.agg_mb_per_sec.toFixed(1)} | ${r.errors} |`;
   }
 }

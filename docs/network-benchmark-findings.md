@@ -28,23 +28,27 @@ node bin/ce-netbench.js --quick --no-remote        # local-only, fast
 | desktop (Debian, 4c/16GB, behind NAT) | live peer | direct DCUtR, ping **5–7 ms**, fresh (1700+ ping samples) |
 | relay (Hetzner 4vCPU/4GB) | bootstrap | ping 39 ms but **stale — last seen 7.4 h ago** |
 
-## Headline numbers (laptop -> desktop, ping floor 5–7 ms)
+## Headline numbers (laptop -> desktop, ping floor 7 ms)
+
+Canonical run: `reports/mesh-desktop.md` / `.json`. Absolute numbers move run-to-run with node load
+(mining + sync bursts cause large p99 tails — itself finding F2); the *shapes* below are stable.
 
 | primitive | result |
 |---|---|
-| directed RPC RTT, 64 B–1 KiB | p50 **16–22 ms**, p99 **230–480 ms** (10–20x tail) |
-| directed RPC RTT, 64 KiB / 256 KiB | p50 **135–160 ms / 448 ms** (~0.5 MB/s payload throughput) |
-| directed RPC concurrency 1 -> 64 (1 KiB) | p50 **16 ms -> 1891 ms**, throughput flat at **~25 req/s** |
-| local blob PUT, 1 MiB | p50 **~870 ms** (under mining load) |
-| object 4 MiB up / down (chunked, c=8) | **2.6 MB/s up / 7.2 MB/s down** |
-| blob PUT, 8 MiB | **ECONNRESET** — connection dropped mid-upload |
+| directed RPC RTT, 64 B–1 KiB | p50 **17–18 ms**, p99 **85–316 ms** (5–18x tail over a 7 ms link) |
+| directed RPC RTT, 64 KiB / 256 KiB | p50 **75 ms / 245 ms** (~1 MB/s effective payload throughput) |
+| directed RPC concurrency 1 -> 64 (1 KiB) | p50 **17 -> 747 ms** (44x), throughput **39 -> 50 req/s** (flat) |
+| local blob PUT, 1 MiB | p50 **40 ms**, **p99 197 ms** (5x tail, loopback) |
+| local blob GET, 1 MiB | p50 **83 ms** — *slower than PUT* |
+| object 4 / 16 MiB chunked (c=8) | up **12.7 / 17.7 MB/s**, down **13.5 / 15.0 MB/s** |
+| blob PUT, 8 MiB | **ECONNRESET** (25/25) — connection dropped mid-upload |
 
 ## Findings
 
-### F1 (P0) — Directed mesh RPC does not parallelize; hard ~25 req/s ceiling
-`send_rtt` at 1 KiB: concurrency 1 / 4 / 16 / 64 -> p50 **16 / 137 / 468 / 1891 ms**, while
-throughput stays flat at **20–33 req/s**. Adding concurrency only adds queueing latency — there is no
-parallel speedup. Every RPC funnels through a single-threaded path: HTTP handler ->
+### F1 (P0) — Directed mesh RPC does not parallelize; throughput ceiling ~40–50 req/s
+`send_rtt` at 1 KiB: concurrency 1 / 4 / 16 / 64 -> p50 **17 / 81 / 272 / 747 ms** (44x), while
+throughput barely moves (**39 / 40 / 48 / 50 req/s**). 64x the offered concurrency buys ~1.3x
+throughput and 44x the latency — there is no parallel speedup, only queueing. Every RPC funnels through a single-threaded path: HTTP handler ->
 `cmd_tx` mpsc(128) -> the one mesh actor (`Swarm` is `!Sync`) -> `send_request`, and inbound requests
 go `event_tx` mpsc(256) -> the node's single event loop -> handled serially with `.await` + locks.
 **Impact:** every mesh-native app (ce-drive, ce-db, ce-query, ce-fn) is capped at ~25–30 req/s per
@@ -59,12 +63,14 @@ threads. Apps see unpredictable multi-hundred-ms stalls on otherwise-trivial cal
 RPC RTT vs size: 64 B = 20 ms, 64 KiB = 135–160 ms, 256 KiB = 448 ms. Effective payload throughput is
 ~0.5 MB/s over a 7 ms link. Directed AppRequest is the wrong channel for bulk data.
 
-### F4 (P0) — Blob/object data path is bottlenecked locally, not by the network
-Local 1 MiB blob PUT p50 ~870 ms; 4 MiB object upload **2.6 MB/s**, download **7.2 MB/s** — and this
-is *loopback*, no network involved. Causes: (a) `std::fs::read/write` (blocking) inside async axum
-handlers, contending with the mining runtime; (b) `provide_chunk` (DHT announce) is **awaited on every
-PUT**; (c) the same tail-latency jitter as F2. **Impact:** ce-storage `PutObject/GetObject` and
-ce-drive file upload/download are gated to single-digit MB/s before the network is even reached.
+### F4 (P0) — Blob/object data path is loopback-bound and erratic
+Chunked object transfer (the app data path) runs at **12–18 MB/s** loopback on a good run but
+collapses to **2–3 MB/s** when the node is busy (observed across runs); local 1 MiB blob GET (p50
+83 ms) is consistently *slower than PUT* (p50 40 ms), with 5x p99 tails — all with no network
+involved. Causes: (a) `std::fs::read/write` (blocking) inside async axum handlers, contending with the
+mining runtime; (b) `provide_chunk` (DHT announce) is **awaited on every PUT**; (c) the same
+tail-latency jitter as F2. **Impact:** ce-storage `PutObject/GetObject` and ce-drive file
+upload/download are gated to low/erratic MB/s before the network is even reached.
 
 ### F5 (P1) — Large uploads reset under load
 An 8 MiB blob PUT during mining returned **ECONNRESET** mid-stream. The PUT handler takes the whole
@@ -109,7 +115,7 @@ Co-located apps cannot do request/reply to themselves. Fix: rebuild + redeploy t
 
 These apps move data as content-addressed chunks over the blob primitive, so their throughput is
 **bounded by F4/F5 above**. The `object_roundtrip` probe approximates their data path directly
-(4 MiB object = 2.6 MB/s up today). Next step: build `ce-storage --features gateway` and drive its
+(4–16 MiB object = 12–18 MB/s on a good run, 2–3 MB/s under load). Next step: build `ce-storage --features gateway` and drive its
 S3 `PutObject/GetObject/ListObjectsV2` endpoints, and the `ce-drive-client` file ops, through the same
 latency/throughput harness to measure the app-level overhead *on top of* the primitive floor. Until
 P0/P1 land, app numbers will track the primitive ceiling, not app logic.

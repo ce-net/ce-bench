@@ -160,6 +160,29 @@ ce-bench/
     └── benchmark-suite.md    the portable benchmark definitions (Node + browser/WASM forms)
 ```
 
+## Network & primitive benchmarks (latency over the real mesh)
+
+The probes above measure *compute*. The `net` module (`src/net.js`) measures the **latency and
+throughput of CE's network primitives** — mesh RPC, directed messaging, blob/object transfer — as an
+app actually experiences them, over the real mesh, with full p50/p90/p99 distributions and
+payload/concurrency scaling sweeps.
+
+```
+# On every node you want to measure TO (adds a responder for request/reply + cold blob fetch):
+node bin/ce-echo.js
+
+# From the probing node — auto-discovers peers, emits a markdown + JSON report:
+node bin/ce-netbench.js --peer <64-hex node id> --out report.md --json report.json
+node bin/ce-netbench.js --quick --no-remote          # local-only, fast
+```
+
+Probes: `probeSendRtt` (directed RPC round-trip; needs no responder — the remote node ACKs at the
+protocol layer), `probeRpcRtt` (full app request/reply, needs `ce-echo`), `probeBlobPut` /
+`probeBlobGetLocal` / `probeBlobGetRemote` (cold cross-node DHT fetch), `probeObjectRoundtrip`
+(chunked file transfer — the ce-storage / ce-drive data path), `probePubsubProp`, and `pingBaseline`.
+See [`docs/network-benchmark-findings.md`](docs/network-benchmark-findings.md) for the first
+real-mesh results and the prioritized improvements they surfaced.
+
 ## Status
 
 **App-complete and self-tested.** Every module (`benchmarks` / `runner` / `profile` / `fabricstats`)

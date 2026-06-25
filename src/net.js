@@ -490,7 +490,14 @@ export async function sweep(a) {
   const out = [];
   for (const size of sizes) {
     for (const c of conc) {
-      const res = await a.probe({ ...a.base, [sizeKey]: size, concurrency: c });
+      // Catch per-cell so one bad size/concurrency (e.g. an oversized upload the node RSTs) is
+      // recorded as an error cell rather than aborting the whole sweep/run.
+      let res;
+      try {
+        res = await a.probe({ ...a.base, [sizeKey]: size, concurrency: c });
+      } catch (e) {
+        res = { error: e instanceof Error ? e.message : String(e), [sizeKey]: size, concurrency: c, errors: 1 };
+      }
       out.push(res);
       if (a.onResult) a.onResult(res);
     }
