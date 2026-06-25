@@ -56,23 +56,72 @@ Other verbs: **ranged GET** (64 KiB window of an 8 MiB object) p50 **1.8 ms**; *
 **Net:** ce-storage is production-fast on a non-mining host. The one real lever is streaming/multipart
 for very large objects (S3); everything else is gated by the node primitives, not the app.
 
-## ce-drive (mesh filesystem) — two-node real mesh
-
-_(measured below once the harness run completes)_
+## ce-drive (mesh filesystem) — two-node real mesh, built + run on the relay
 
 Harness: `ce-drive-client/examples/bench_drive.rs` — boots two in-process CE nodes wired over libp2p
 (node B hosts a `DriveServer`, node A drives the `ce-drive/v1` op set as a `RemoteDrive` by
-capability). Every op is a real mesh request/reply between two distinct nodes; co-located so it
+capability). Every op is a real mesh request/reply between two distinct nodes; co-located, so it
 isolates the app + protocol + node overhead (DriveTree CRDT, content-addressed chunking,
-authorize-on-every-op). Add real cross-node RTT (ce-bench send_rtt: desktop p50 ~17 ms) on top.
+authorize-on-every-op) — add real cross-node RTT (ce-bench send_rtt: desktop p50 ~17 ms) on top.
+Built lean (no debuginfo) and run on the relay; raw: `ce-bench/reports/ce-drive-relay.txt`.
+
+| op | p50 ms | p90 ms | p99 ms | MB/s (p50) |
+|---|---:|---:|---:|---:|
+| open / handshake   | 888  | 1332 | 1425 | - |
+| mkdir              | 137  | 139  | 856  | - |
+| write 4 KiB        | 1090 | 1306 | 1384 | 0.0 |
+| write 64 KiB       | 959  | 1157 | 1242 | 0.1 |
+| write 256 KiB      | 987  | 1111 | 1178 | 0.3 |
+| write 1 MiB        | 1128 | 1416 | 1416 | 0.9 |
+| write 4 MiB        | 2338 | 2703 | 2703 | 1.7 |
+| read 4 KiB         | 143  | 145  | 773  | 0.0 |
+| read 64 KiB        | 145  | 379  | 909  | 0.4 |
+| read 256 KiB       | 146  | 533  | 711  | 1.7 |
+| read 1 MiB         | 163  | 945  | 945  | 6.1 |
+| read 4 MiB         | 261  | 1371 | 1371 | 15.3 |
+| read ranged 64 KiB | 140  | 640  | 786  | 0.4 |
+| list_all           | 146  | 152  | 156  | - |
+| mirror bootstrap   | 2453 (single) | | | - |
+| mirror sync 1 chg  | 2784 | 3846 | 5690 | - |
+
+(4 transient RPC retries across the whole run — the directed RPC itself was stable here; the earlier
+aborts were a harness bug, not the mesh.)
+
+### ce-drive findings
+
+- **D1 (P0) — ~140 ms metadata-op floor = the DriveServer's 100 ms inbox poll.** mkdir / small read /
+  list / ranged-read all land at p50 ~137-146 ms with almost no size dependence. `DriveServer.run(100)`
+  **polls `/mesh/messages` every 100 ms** instead of consuming the push stream (`/mesh/messages/stream`,
+  which the node already exposes and ce-echo uses). Every op pays ~half the poll interval. Switching
+  serve.rs to the SSE stream would roughly halve the floor immediately.
+- **D2 (P0) — writes have a ~1 s floor and ~1-2 MB/s throughput**, ~6-8x slower than reads at every
+  size (write 1 MiB 1128 ms vs read 1 MiB 163 ms). A write is `put_object` (chunk -> blob PUT + DHT
+  announce **per chunk**) + a commit RPC + a feed append — several poll-gated round trips stacked on
+  the slow blob PUT path (primitive F4). This is the dominant ce-drive cost.
+- **D3 — reads scale with size, writes don't.** read 4 MiB hits 15 MB/s (chunk fetch parallelizes via
+  ReadPlan); writes stay ~1-2 MB/s (serial chunk PUT + announce). Parallelizing chunk PUT and making
+  the announce fire-and-forget (primitive F4 fix) would lift write throughput directly.
+- **D4 — Mirror is expensive**: bootstrap 2.45 s, sync-one-change p50 2.78 s (p99 5.69 s). It
+  reconstructs/polls the DriveTree + change feed + beacon; the per-sync cost makes `rdev watch`-style
+  live mirroring laggy. Push-driven change delivery (D1) plus incremental feed application would help.
+
+### Comparison: ce-storage vs ce-drive (same blob substrate)
+
+ce-storage GET 1 MiB = **6 ms / 161 MB/s**; ce-drive read 1 MiB = **163 ms / 6 MB/s** — ~25x slower.
+Both sit on the same content-addressed blobs; the gap is entirely ce-drive's mesh+poll+CRDT path vs
+ce-storage's direct local HTTP->blob. The takeaway: the blob substrate is fast (ce-storage proves it);
+ce-drive's latency is **its own** poll-based transport (D1) and serial write path (D2), both fixable
+in the app without node changes.
 
 ## Where each app was run, and why
 
-| app | build host | run host | why |
+| app | build host | run host | notes |
 |---|---|---|---|
-| ce-storage | relay (Linux) | relay node | light build (no ce-node); gateway is HTTP + self-contained on the node — no live laptop<->relay mesh link needed |
-| ce-drive | laptop (warm debug cache) | two in-process nodes | needs `ce-node` (heavy); relay too small to compile it (2.7 GB RAM / 14 GB disk, cold cache), desktop unreachable (no capability in wallet), and the laptop<->relay mesh link is stale (F6) |
+| ce-storage | relay (Linux) | relay node | light build (no ce-node); gateway is HTTP, self-contained on the node — benchmarked over localhost on the relay |
+| ce-drive | relay (Linux) | relay (2 in-process nodes) | needs `ce-node` (heavy); built lean (no debuginfo, ~3.5 min) with an 8 GB swapfile for the link; `bench_drive` boots its own 2-node mesh, so it runs entirely on the relay |
 
-To run ce-drive across **physical** machines (laptop <-> desktop), the desktop must issue the laptop a
-capability (`ce grant <laptop-id> --can spawn,sync`) so the harness can be built+run there; the same
-`bench_drive` binary then runs on the desktop node with node A on the laptop.
+Both apps were built and run on the relay. ce-drive's harness is self-contained (it spins up its own
+two CE nodes), so the co-located numbers isolate app overhead; for a cross-continent figure add the
+measured cross-node RTT from the primitive report. Running it across **physical** machines
+(e.g. laptop host <-> desktop client) needs the desktop to grant the laptop a capability
+(`ce grant <laptop-id> --can spawn,sync`); the same binary then runs there unchanged.
