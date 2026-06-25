@@ -31,7 +31,7 @@ import {
 import { apiToken, parseArgs } from "./_env.js";
 
 const args = parseArgs(process.argv.slice(2));
-const baseUrl = args.url || "http://localhost:8844";
+const baseUrl = args.url || "http://127.0.0.1:8844";
 const token = args.token || apiToken();
 const quick = !!args.quick;
 const ce = new CeClient({ baseUrl, token, timeoutMs: 60000 });
@@ -73,17 +73,21 @@ log("\n[1/6] ping floor (/netgraph)...");
 report.sections.ping = await pingBaseline(ce).catch((e) => ({ error: e.message }));
 
 // ---- 2. RPC RTT self (the API+serde floor) --------------------------------
+// Needs the node's self-request short-circuit (POST /mesh/request with to == own id). Older node
+// binaries route self over the network and "fail to dial self" — detect that and skip cleanly.
 log("[2/6] rpc_rtt self (API + serde floor)...");
 report.sections.rpc_self = [];
-try {
-  await ce.subscribe("ce-bench/echo"); // self-request needs a local subscriber that we answer inline
-  // For self we cannot rely on ce-echo; run a one-shot inline responder for the duration.
+const selfOk = await withInlineResponder(ce, async () => {
+  const t = await probeRpcRtt({ ce, to: self, bytes: 64, iters: 3, timeoutMs: 4000 });
+  return t.errors < 3;
+}).catch(() => false);
+if (selfOk) {
   report.sections.rpc_self = await withInlineResponder(ce, () =>
     sweep({ probe: probeRpcRtt, base: { ce, to: self, iters: RPC_ITERS }, sizes: RPC_SIZES, sizeKey: "bytes", onResult: liveRpc }),
   );
-} catch (e) {
-  report.sections.rpc_self = [{ error: e.message }];
-  log(`  self rpc skipped: ${e.message}`);
+} else {
+  report.sections.rpc_self = { skipped: true, reason: "node lacks self-request short-circuit (dials self)" };
+  log("  self rpc skipped: node routes self-request over the network (no local short-circuit)");
 }
 
 // ---- 3. RPC RTT to peers (needs ce-echo on the peer) ----------------------
@@ -131,7 +135,10 @@ for (const peer of peers) {
 // ---- 6. Concurrency scaling sweep (rpc @ 1KiB) ----------------------------
 log("[6/6] concurrency scaling (rpc_rtt @ 1KiB)...");
 report.sections.concurrency = {};
-const concTargets = [{ id: self, label: "self" }, ...peers.filter((p) => !report.sections.rpc_peers[p]?.skipped).map((p) => ({ id: p, label: p.slice(0, 12) }))];
+const concTargets = [
+  ...(selfOk ? [{ id: self, label: "self" }] : []),
+  ...peers.filter((p) => !report.sections.rpc_peers[p]?.skipped).map((p) => ({ id: p, label: p.slice(0, 12) })),
+];
 for (const t of concTargets) {
   const run = async () =>
     sweep({ probe: probeRpcRtt, base: { ce, to: t.id, bytes: KiB, iters: Math.max(RPC_ITERS, 40), timeoutMs: 20000 }, concurrency: CONC_LEVELS, onResult: (r) => log(`  ${t.label} c=${r.concurrency}: p50 ${r.ms.p50.toFixed(1)}ms p99 ${r.ms.p99.toFixed(1)}ms ${r.reqs_per_sec.toFixed(0)} req/s`) });

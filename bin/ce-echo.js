@@ -12,7 +12,7 @@ import { startEchoResponder } from "../src/echo.js";
 import { apiToken, parseArgs } from "./_env.js";
 
 const args = parseArgs(process.argv.slice(2));
-const baseUrl = args.url || "http://localhost:8844";
+const baseUrl = args.url || "http://127.0.0.1:8844";
 const token = args.token || apiToken();
 if (!token) {
   console.error("ce-echo: no api.token found (data dir or CE_API_TOKEN). Writes will be rejected.");
