@@ -113,6 +113,43 @@ ce-storage's direct local HTTP->blob. The takeaway: the blob substrate is fast (
 ce-drive's latency is **its own** poll-based transport (D1) and serial write path (D2), both fixable
 in the app without node changes.
 
+## Upgrades implemented (and measured)
+
+Acting on D1-D4 (all app/SDK-layer, no node changes), re-benchmarked on the same relay 2-node mesh.
+Raw before/after: `reports/ce-drive-relay.txt` / `reports/ce-drive-relay-after.txt`.
+
+- **D1 — DriveServer now consumes the push stream** (`ce-drive-serve/src/serve.rs`): replaced the
+  100 ms `/mesh/messages` poll loop with `messages_stream()` (SSE), plus a one-shot inbox drain on
+  each (re)connect so nothing is missed in the connect gap. **Result: the metadata-op floor collapsed
+  ~8x.**
+- **D2/D3 — parallel chunk transfer** (`ce-rs` `put_object`/`get_object`): chunks now upload
+  unordered and download in-order at `OBJECT_CHUNK_CONCURRENCY = 8` instead of one-at-a-time. Helps
+  multi-chunk objects (≥ a few MiB); also speeds Mirror's snapshot fetch. (This change also benefits
+  ce-storage, which uses the same `put_object`/`get_object`.)
+- **D4 — Mirror sync** (`ce-drive-client/src/mirror.rs`): skip the redundant trailing empty poll
+  (break on a partial page) and inherit the faster RPCs from D1. The deeper incremental-apply
+  (avoid full re-bootstrap per change) is the remaining "M3" optimization — left as a flagged
+  follow-up because it is a correctness-sensitive CRDT-delta rewrite.
+
+| op | before p50 | after p50 | change |
+|---|--:|--:|--:|
+| mkdir              | 137 ms | **17 ms**  | **8x faster** |
+| list_all           | 146 ms | **20 ms**  | **7x faster** |
+| read 4 KiB         | 143 ms | **18 ms**  | **8x faster** |
+| read 64 KiB        | 145 ms | **18 ms**  | **8x faster** |
+| read 256 KiB       | 146 ms | **24 ms**  | **6x faster** |
+| read ranged 64 KiB | 140 ms | **62 ms**  | 2.3x faster |
+| read 4 MiB (MB/s)  | 15.3   | **24.5**   | 1.6x throughput (D3) |
+| write 1 MiB        | 1128 ms| 1216 ms    | ~same* |
+| mirror sync 1 chg  | 2784 ms| 2545 ms    | 1.1x |
+
+*Writes are gated by the **node's** blob-PUT path (`provide_chunk` DHT announce awaited per PUT —
+primitive F4, a node change). This 2-node *ephemeral* mesh has no real DHT, so each announce stalls
+~1 s; on the well-connected relay node, ce-storage PUT 1 MiB was **11 ms**. So write latency here is
+the ephemeral-DHT artifact, not the app; the D2 parallel-PUT win lands on real nodes + multi-chunk
+objects. Closing the write gap fully needs the node-side fix (don't await the announce on the PUT hot
+path) tracked in `network-benchmark-findings.md` F4.
+
 ## Where each app was run, and why
 
 | app | build host | run host | notes |

@@ -1,0 +1,22 @@
+# ce-drive benchmark — two in-process CE nodes over libp2p mesh
+# host=B ba019b71c91e client=A c3f8b7b19f5a
+
+open/handshake         n=15  p50= 1196.07 p90= 1777.08 p99= 1955.76 mean= 1203.49 MB/s=       -
+mkdir                  n=20  p50=   16.87 p90=   25.50 p99=  753.95 mean=   67.63 MB/s=       -
+write 4KiB             n=10  p50= 1126.18 p90= 1531.06 p99= 1685.89 mean= 1220.02 MB/s=     0.0
+write 64KiB            n=10  p50= 1090.90 p90= 1269.88 p99= 1342.55 mean= 1141.10 MB/s=     0.1
+write 256KiB           n=10  p50= 1087.14 p90= 1159.78 p99= 1160.01 mean= 1084.59 MB/s=     0.2
+write 1MiB             n=5   p50= 1216.17 p90= 1414.53 p99= 1414.53 mean= 1207.44 MB/s=     0.8
+write 4MiB             n=5   p50= 2217.39 p90= 2435.55 p99= 2435.55 mean= 2228.80 MB/s=     1.8
+read 4KiB              n=10  p50=   17.84 p90=  274.66 p99= 1317.21 mean=  173.67 MB/s=     0.2
+read 64KiB             n=10  p50=   17.82 p90=  403.58 p99=  986.14 mean=  153.69 MB/s=     3.5
+read 256KiB            n=10  p50=   23.83 p90=  604.51 p99=  807.23 mean=  161.83 MB/s=    10.5
+read 1MiB              n=5   p50=  139.52 p90=  807.24 p99=  807.24 mean=  317.70 MB/s=     7.2
+read 4MiB              n=5   p50=  163.08 p90= 1523.13 p99= 1523.13 mean=  435.46 MB/s=    24.5
+read ranged 64KiB      n=12  p50=   62.03 p90=  297.65 p99= 1354.56 mean=  184.32 MB/s=     1.0
+list_all /w            n=20  p50=   20.23 p90=   26.50 p99=   37.75 mean=   21.99 MB/s=       -
+mirror bootstrap         = 2300.47 ms
+mirror sync(1 change)  n=10  p50= 2544.73 p90= 2696.58 p99= 2830.71 mean= 2533.01 MB/s=       -
+
+# transient RPC retries during run: 1 (flaky directed-RPC under rapid load)
+# done
