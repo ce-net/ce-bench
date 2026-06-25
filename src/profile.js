@@ -139,6 +139,16 @@ async function detectBrowserEnv() {
     webgpu: !!nav.gpu,
     kind: "Browser",
   };
+  // navigator.connection (Chromium) is an advisory link hint, not a measurement. Optional everywhere.
+  const c = nav.connection;
+  if (c && typeof c === "object") {
+    /** @type {any} */
+    const link = {};
+    if (typeof c.effectiveType === "string") link.type = c.effectiveType;
+    if (Number.isFinite(c.downlink)) link.downlink_mbps = c.downlink;
+    if (Number.isFinite(c.rtt)) link.rtt_ms = c.rtt;
+    if (Object.keys(link).length) env.link = link;
+  }
   return env;
 }
 
@@ -166,6 +176,7 @@ function normalizeEnv(e) {
     webgpu: !!(e && e.webgpu),
     kind,
     gpus,
+    link: e && typeof e.link === "object" ? e.link : undefined,
   };
 }
 
@@ -284,11 +295,42 @@ export function assembleProfile(args) {
     samples: selectSamples(results),
   };
 
+  // Optional network-quality axis: from a measured probe (args.network) and/or browser link hints
+  // (env.link). Only attached when something is known, so older/limited nodes stay valid.
+  const network = buildNetwork(args.network, e.link);
+  if (network) profile.network = network;
+
   const problems = validateProfile(profile);
   if (problems.length) {
     throw new Error("assembleProfile: invalid profile — " + problems.join("; "));
   }
   return profile;
+}
+
+/**
+ * Build the optional `network` axis from a measured probe and/or browser link hints. Returns
+ * `undefined` when nothing is known (so the field is omitted rather than a misleading all-zero).
+ * @param {any} measured  {relay_rtt_ms?, down_mbps?, up_mbps?}
+ * @param {any} link      browser navigator.connection hint {type?, downlink_mbps?, rtt_ms?}
+ * @returns {import("./types.js").NetworkInfo | undefined}
+ */
+function buildNetwork(measured, link) {
+  /** @type {any} */
+  const n = {};
+  const numOpt = (v) => (FINITE(v) && v >= 0 ? v : undefined);
+  if (measured && typeof measured === "object") {
+    if (numOpt(measured.relay_rtt_ms) !== undefined) n.relay_rtt_ms = measured.relay_rtt_ms;
+    if (numOpt(measured.down_mbps) !== undefined) n.down_mbps = measured.down_mbps;
+    if (numOpt(measured.up_mbps) !== undefined) n.up_mbps = measured.up_mbps;
+  }
+  if (link && typeof link === "object") {
+    const l = {};
+    if (typeof link.type === "string" && link.type) l.type = link.type;
+    if (numOpt(link.downlink_mbps) !== undefined) l.downlink_mbps = link.downlink_mbps;
+    if (numOpt(link.rtt_ms) !== undefined) l.rtt_ms = link.rtt_ms;
+    if (Object.keys(l).length) n.link = l;
+  }
+  return Object.keys(n).length ? n : undefined;
 }
 
 /**

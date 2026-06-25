@@ -75,8 +75,23 @@ export const BENCH_KINDS = /** @type {const} */ ([
  * @property {{total_gb:number,free_gb:number,read_mbps:number,write_mbps:number}} storage
  * @property {{ref_model:string,tokens_per_sec:number,ctx_tokens:number}} llm
  * @property {{os:string,arch:string,docker:boolean,gvisor:boolean,wasm:boolean,webgpu:boolean,kind:typeof NODE_KINDS[number]}} runtime
+ * @property {NetworkInfo} [network]     Optional network-quality axis (rtt/bandwidth/link). Absent on
+ *                                       older profiles; placement degrades gracefully without it.
  * @property {BenchResult[]} samples     Bounded raw evidence (cap ~16) so scalars can be audited.
  * @property {string} [sig]              128-hex Ed25519 signature, added by the node on publish.
+ */
+
+/**
+ * Network-quality axis for a node: how well it can move bytes to its neighbours/the relay. Every
+ * field is optional — a node that cannot measure a dimension simply omits it (never a fake zero), and
+ * the scheduler treats a missing dimension as unknown rather than bad.
+ *
+ * @typedef {object} NetworkInfo
+ * @property {number} [relay_rtt_ms]  Smoothed RTT to the relay/hub (ms).
+ * @property {number} [down_mbps]     Measured download throughput (Mbps).
+ * @property {number} [up_mbps]       Measured upload throughput (Mbps).
+ * @property {{type?:string,downlink_mbps?:number,rtt_ms?:number}} [link]  Best-effort link hints
+ *           (e.g. browser navigator.connection: effectiveType/downlink/rtt). Advisory, not measured.
  */
 
 /**
@@ -168,6 +183,14 @@ export function validateProfile(p, opts = {}) {
     errs.push("llm{ref_model,tokens_per_sec} required");
   }
   if (!p.runtime || !NODE_KINDS.includes(p.runtime.kind)) errs.push("runtime.kind must be in NODE_KINDS");
+  // network is optional; if present, every numeric field must be a non-negative finite number.
+  if (p.network !== undefined) {
+    const n = p.network;
+    const okOpt = (v) => v === undefined || NONNEG(v);
+    if (!n || typeof n !== "object" || !okOpt(n.relay_rtt_ms) || !okOpt(n.down_mbps) || !okOpt(n.up_mbps)) {
+      errs.push("network, if present, must be an object with non-negative relay_rtt_ms/down_mbps/up_mbps");
+    }
+  }
   if (!Array.isArray(p.samples)) errs.push("samples must be an array");
   if (Array.isArray(p.samples) && p.samples.length > 16) errs.push("samples capped at 16 (gossip frame budget)");
 
